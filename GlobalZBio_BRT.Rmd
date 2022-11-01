@@ -1,0 +1,321 @@
+---
+title: "GlobalZBio_BRT"
+author: "Jasmine Fowler-Morrow"
+date: '2022-11-01'
+output: pdf_document
+---
+
+
+```{r}
+############ Preliminaries ################
+library(xgboost)
+library(caret)
+library(tidyverse)
+library(raster)
+library(ggplot2)
+library(terra)
+library(sf)
+library(dplyr)
+
+dat <- readRDS("Data/GlobalBiomassData.rds") 
+#dat2 <- readRDS("Data/GlobalBiomassDataESM.rds") ESM data? 
+
+# Reduce some extreme values, and remove 5 zero values  
+dat <- dat %>% 
+  mutate(
+    Mesh = replace(Mesh, Mesh > 1000, 1000),
+    Depth = replace(Depth, Depth > 1500, 1500),
+    Depth2 = Depth/1000, #scaled depth variable 
+    Bathy = replace(Bathy, Bathy > 7000, 7000),
+    SST = replace(SST, SST > 31, 31),
+    Biomass = replace(Biomass, Biomass > 10000, 10000)) %>%
+  filter(Biomass > 0)
+```
+
+```{r}
+#-------------------------------------------------------
+             # TRAIN TEST SPLIT
+#-------------------------------------------------------
+#make this example reproducible
+set.seed(0)
+
+#split into training (80%) and testing set (20%)
+#by default, the split uses percentiles of y and has well balanced pred
+parts = createDataPartition(dat$Biomass, p = .8, list = F)
+
+# only include a few predictors for now 
+train = as.data.frame(dat[parts,
+                          c("Biomass","BiomassMethod","DOY","Depth",
+                            "Bathy","SST","Chl","TimeLocal","Mesh",
+                            "DatasetID","Gear")]) 
+test = as.data.frame(dat[-parts, 
+                         c("Biomass","BiomassMethod","DOY","Depth",
+                           "Bathy","SST","Chl","TimeLocal","Mesh",
+                           "DatasetID","Gear")])  
+
+#define predictor and response variables in training set
+train_x = data.matrix(train[, -1]) #column 1 is biomass 
+train_y = train[,1]
+
+#define predictor and response variables in testing set
+test_x = data.matrix(test[, -1])
+test_y = test[, 1]
+
+#define final training and testing sets
+xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+
+#define watchlist
+watchlist = list(train=xgb_train, test=xgb_test)
+```
+
+
+```{r}
+#---------------------------------------------------------
+        # train with optimal parameters 
+#---------------------------------------------------------
+#1000 rounds, eta = 0.1, max depth 6, min child 5
+
+#fit XGBoost model and display training and testing data at each round
+model = xgb.train(data = xgb_train, max_depth = 6,
+                  eta = 0.1, min_child_weight = 5,
+                  objective = "reg:gamma",
+                  early_stopping_rounds = 50,
+                  watchlist=watchlist, nrounds = 1000,
+                  verbose = FALSE)
+
+y_pred <- predict(model, test_x)
+
+saveRDS(model,"./Output/BRT_final.rds")
+
+model <- readRDS("./Output/BRT_final.rds") ##OR READ IN 
+
+```
+
+```{r}
+#-------------------------------------------------------
+            # check accuracy metrics
+#-------------------------------------------------------
+mean((test_y - y_pred)^2) #mse
+MAE(test_y, y_pred) #mae
+RMSE(test_y, y_pred) #rmse
+model$evaluation_log
+
+# variable importance plot
+vip::vip(model)
+ggsave("./Figures/BRT_pred_importance.png")
+```
+
+```{r}
+#-------------------------------------------------------
+           #set up data to predict biomass  
+#-------------------------------------------------------
+
+## IMPORT BATHYMETRY DATA AND ORIENT LATITUDES TO BE SOUTH TO NORTH
+bathy_data <- readRDS(file.path("Data","Bathy_raster_oneDeg.rds"))
+bathy_matrix <- t(as.matrix(bathy_data$Bathy))
+bathy_matrix <- bathy_matrix[,180:1]
+
+## Calculate areas of grid cells
+glob_area <- t(as.matrix(raster::area(raster())))
+
+##### Set up array to make predictions and save outputs ######
+save_array <- array(NA, dim = c(12,13,64800)) 
+# matches month x variable x bathy #
+dimnames(save_array)[[1]] <- c("Jan", "Feb", "Mar", "Apr", 
+                               "May", "Jun", "Jul", "Aug", 
+                               "Sep", "Oct", "Nov", "Dec")
+dimnames(save_array)[[2]] <- c("Longitude", "Latitude", 
+                              "BiomassMethod","DOY","Depth",
+                              "Bathy","SST","Chl","TimeLocal","Mesh",
+                               "DatasetID","Gear", "BRT_Mesozoo")
+
+## Set mesh, start depth and time of day
+save_array[,"Mesh",] <- 100 # we might want this at 0/25??
+save_array[,"Depth",] <- 1
+save_array[,"TimeLocal",] <- 0
+
+## Final output matrix, with non-important factors removed
+save_array2 <- save_array[,-c(3,4,5,9,10,11,12),] 
+#keeps lon, lat, bathy, predictions
+
+#Longitude x Latitude matrix
+lonlat <- as.matrix(expand.grid("lons" = -179.5:179.5, 
+                                "lats" = -89.5:89.5))
+
+## Harmonic day of year for each month
+days_of_year <- seq(15,365,30)
+
+## Depth is set to surface, this can be changed to a vector of depths...
+depth <- 0.5
+
+```
+
+
+```{r}
+#----------------------------------------------
+      # get predictions for every month 
+#----------------------------------------------
+
+for (k in 1:12){
+  print(paste0("Now working on month ",k))
+  
+  ## Import current month (k) sst and chl climatology
+  curr_sst <- 
+    t(as.matrix(readRDS(list.files(
+      path = './Data/',
+      pattern = glob2rx(paste("SST*", 
+                              dimnames(save_array)[[1]][k], "*", 
+                              sep = "")), full.names = TRUE))))[, 180:1]
+  curr_chl <- 
+    t(as.matrix(readRDS(list.files(
+      path = './Data/',
+      pattern = glob2rx(paste("Chl*", 
+                              dimnames(save_array)[[1]][k], 
+                              "*", sep = "")), full.names = TRUE))))[, 180:1]
+  
+  ## Fill in this month's slice of save_array
+  save_array[k, "Longitude", ] <- lonlat[, 1]
+  save_array[k, "Latitude", ] <- lonlat[, 2]
+  save_array[k, "Bathy", ] <- as.vector(bathy_matrix)
+  
+  save_array[k, "DOY", 1:64800] <- days_of_year[k] 
+  
+  save_array[k, "SST", ] <- as.vector(curr_sst)
+  save_array[k, "Chl", ] <- as.vector(curr_chl)
+  
+  #Align SST and chlo maps with bathy (where bathy is land, mask sst and chlo)
+  save_array[k, "SST", 
+             which(is.na(save_array[k, "Bathy", ] == TRUE))] <- NA
+  save_array[k, "Chl", 
+             which(is.na(save_array[k, "Bathy", ] == TRUE))] <- NA
+  
+  # Convert to dataframe and add random effects factors and 0.5m depth for glmm prediction
+  kk <- as.data.frame(t(save_array[k, , ])) #df of month k only 
+  kk$BiomassMethod <- as.numeric(as.factor("Carbon"))
+  kk$Gear <- as.numeric(as.factor("116"))
+  kk$DatasetID <- as.numeric(as.factor("100"))
+  kk$Depth <- depth
+  
+  ####### SURFACE LAYER PREDICTIONS ########
+  # Get surface layer estimate
+  kk$BRT_Mesozoo <- predict(model,
+                             newdata = as.matrix(kk[,3:12]))
+  
+  ## Dump output into this month's time slice of save array2
+  save_array2[k, "Longitude", ] <- as.vector(kk$Longitude)
+  save_array2[k, "Latitude", ] <- as.vector(kk$Latitude)
+  save_array2[k, "Bathy", ] <- as.vector(kk$Bathy)
+  save_array2[k, "SST", ] <- as.vector(kk$SST)
+  save_array2[k, "Chl", ] <- as.vector(kk$Chl)
+  save_array2[k, "BRT_Mesozoo", ] <- as.vector(kk$BRT_Mesozoo)
+}
+```
+
+```{r}
+## now change the way monthly predictions are stored for average maps
+#very average code but the arrays are tricky to work with so here we are 
+biomass_monthly <- data.frame(Jan = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Feb = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Mar = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Apr = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              May = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Jun = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Jul = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Aug = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Sep = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Oct = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Nov = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Dec = rep(0,length(as.vector(kk$BRT_Mesozoo))),
+                              Longitude = lonlat[,1],
+                              Latitude = lonlat[,2])
+
+for (j in 1:12){
+  biomass_monthly[,j] <- save_array2[j, "BRT_Mesozoo", ]
+}
+
+
+```
+
+
+```{r}
+## code to take an average over a few months and produce/save figure
+monthly_mean_plot <- function(months){
+  
+  names <- colnames(biomass_monthly[,months])
+  plot_name <- paste(names[1],names[3],
+                     "map", sep = "_") #name to save plot
+  
+  #take mean over multiple months 
+  biomass_monthly$mean <- rowMeans(biomass_monthly[,months], na.rm = T)
+  
+  ## plot with projection 
+  kk_sf <- biomass_monthly %>%
+    sf::st_as_sf(coords=c("Longitude", "Latitude"))
+  
+  lon_lat <- "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+  
+  sf::st_crs(kk_sf) <- lon_lat
+  
+  landmass <- rnaturalearth::ne_countries(scale = "large") %>% 
+    sf::st_as_sf(crs = lon_lat)
+  
+  # Mollweide equal-area projection
+  moll <- "+proj=moll +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m no_defs" 
+  
+  # Transform data using projection
+  kk_transformed <- kk_sf %>%
+    sf::st_transform(moll)
+  
+  # Transform the landmass to the same projection
+  landmass <- landmass %>% 
+    sf::st_transform(crs = moll)
+  
+  plot_name <- ggplot() + 
+    geom_sf(data = kk_transformed, aes(color = mean), size = 0.01) +
+    geom_sf(data = landmass, fill = "grey20", color = NA, size = 0.01) +
+    scale_color_viridis_c(trans = "log10",
+                          na.value = "grey20",
+                          name = expression(paste("Z biomass mg m"^-2))) +
+    theme_bw() 
+  return(plot_name)
+}
+
+monthly_mean_plot(c(12,1,2))
+```
+
+
+
+```{r}
+## plot with projection 
+kk_sf <- kk %>%
+  sf::st_as_sf(coords=c("Longitude", "Latitude"))
+
+lon_lat <- "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+
+sf::st_crs(kk_sf) <- lon_lat
+
+landmass <- rnaturalearth::ne_countries(scale = "large") %>% 
+  sf::st_as_sf(crs = lon_lat)
+
+# Mollweide equal-area projection
+moll <- "+proj=moll +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m no_defs" 
+
+# Transform data using projection
+kk_transformed <- kk_sf %>%
+  sf::st_transform(moll)
+
+# Transform the landmass to the same projection
+landmass <- landmass %>% 
+  sf::st_transform(crs = moll)
+
+
+ggplot() + 
+  geom_sf(data = kk_transformed, aes(color = BRT_Mesozoo), size = 0.01) +
+  geom_sf(data = landmass, fill = "grey20", color = NA, size = 0.01) +
+  scale_color_viridis_c(trans = "log10",
+                        na.value = "grey20",
+                        name = expression(paste("Z biomass mg m"^-2))) +
+  theme_bw() 
+```
+
