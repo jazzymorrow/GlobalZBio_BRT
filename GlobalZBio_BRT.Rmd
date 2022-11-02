@@ -16,6 +16,7 @@ library(ggplot2)
 library(terra)
 library(sf)
 library(dplyr)
+library(patchwork)
 
 dat <- readRDS("Data/GlobalBiomassData.rds") 
 #dat2 <- readRDS("Data/GlobalBiomassDataESM.rds") ESM data? 
@@ -77,19 +78,29 @@ watchlist = list(train=xgb_train, test=xgb_test)
 #1000 rounds, eta = 0.1, max depth 6, min child 5
 
 #fit XGBoost model and display training and testing data at each round
-model = xgb.train(data = xgb_train, max_depth = 6,
-                  eta = 0.1, min_child_weight = 5,
-                  objective = "reg:gamma",
-                  early_stopping_rounds = 50,
-                  watchlist=watchlist, nrounds = 1000,
-                  verbose = FALSE)
-
-y_pred <- predict(model, test_x)
-
-saveRDS(model,"./Output/BRT_final.rds")
+# model = xgb.train(data = xgb_train, max_depth = 6,
+#                   eta = 0.1, min_child_weight = 5,
+#                   objective = "reg:gamma",
+#                   early_stopping_rounds = 50,
+#                   watchlist=watchlist, nrounds = 1000,
+#                   verbose = FALSE)
+# 
+# saveRDS(model,"./Output/BRT_final.rds")
 
 model <- readRDS("./Output/BRT_final.rds") ##OR READ IN 
+y_pred <- predict(model, test_x)
+cor(y_pred, test_y) # 0.594 R^2 = 0.35
+cor.test(y_pred, test_y)
 
+y_pred <- predict(model, train_x)
+cor(y_pred, train_y) #0.724 R^2 = 0.52
+
+y_pred <- predict(model, data.matrix(as.data.frame(dat[c("BiomassMethod",
+                                        "DOY","Depth","Bathy",
+                                        "SST","Chl","TimeLocal",
+                                        "Mesh","DatasetID","Gear")])))
+cor(y_pred, dat$Biomass)^2 #R^2 = 0.49
+cor.test(y_pred, dat$Biomass) #yay p<2.2e-16
 ```
 
 ```{r}
@@ -98,12 +109,14 @@ model <- readRDS("./Output/BRT_final.rds") ##OR READ IN
 #-------------------------------------------------------
 mean((test_y - y_pred)^2) #mse
 MAE(test_y, y_pred) #mae
+
+#average difference between predicted and observed values in test set
 RMSE(test_y, y_pred) #rmse
 model$evaluation_log
 
 # variable importance plot
 vip::vip(model)
-ggsave("./Figures/BRT_pred_importance.png")
+#ggsave("./Figures/BRT_pred_importance.png")
 ```
 
 ```{r}
@@ -131,7 +144,7 @@ dimnames(save_array)[[2]] <- c("Longitude", "Latitude",
                                "DatasetID","Gear", "BRT_Mesozoo")
 
 ## Set mesh, start depth and time of day
-save_array[,"Mesh",] <- 100 # we might want this at 0/25??
+save_array[,"Mesh",] <- 25 # we might want this at 0/25??
 save_array[,"Depth",] <- 1
 save_array[,"TimeLocal",] <- 0
 
@@ -200,7 +213,8 @@ for (k in 1:12){
   ####### SURFACE LAYER PREDICTIONS ########
   # Get surface layer estimate
   kk$BRT_Mesozoo <- predict(model,
-                             newdata = as.matrix(kk[,3:12]))
+                             newdata = as.matrix(kk[,3:12]),
+                            outputmargin = FALSE)
   
   ## Dump output into this month's time slice of save array2
   save_array2[k, "Longitude", ] <- as.vector(kk$Longitude)
@@ -276,12 +290,14 @@ monthly_mean_plot <- function(months){
     geom_sf(data = landmass, fill = "grey20", color = NA, size = 0.01) +
     scale_color_viridis_c(trans = "log10",
                           na.value = "grey20",
-                          name = expression(paste("Z biomass mg m"^-2))) +
+                          name = expression(paste("Z biomass mg m"^-2)),
+                          limits = c(0.1,10), oob = scales::squish) +
     theme_bw() 
   return(plot_name)
 }
 
 monthly_mean_plot(c(12,1,2))
+#ggsave("./Figures/Dec_Feb_surface_biomass.png")
 ```
 
 
@@ -315,7 +331,68 @@ ggplot() +
   geom_sf(data = landmass, fill = "grey20", color = NA, size = 0.01) +
   scale_color_viridis_c(trans = "log10",
                         na.value = "grey20",
-                        name = expression(paste("Z biomass mg m"^-2))) +
+                        name = expression(paste("Z biomass mg m"^-2)),
+                        limits = c(0.1,10), oob = scales::squish) +
   theme_bw() 
+ggsave("./Figures/year_surface_biomass.png")
+```
+
+```{r}
+
+#Dec- Feb
+p1 <- monthly_mean_plot(c(12,1,2))
+#Mar - May
+p2 <- monthly_mean_plot(c(3:5))
+#Jun - Aug
+p3 <- monthly_mean_plot(c(6:8))
+#Sep - Nov
+p4 <- monthly_mean_plot(c(9:11))
+
+#combining them with incorrect colour scales is not a good visualisation 
+(p1 | p2) / (p3 | p4) + plot_annotation(tag_levels = "A") + 
+  plot_layout(guides = "collect") & theme(legend.position = "bottom", 
+                                          plot.margin = margin(0.25,0.25,0.25,0.25),
+                                          plot.tag = element_text(size = 11))
+
+
+#ggsave(paste0("./Figures/","BRTmonthly_maps",".pdf"))
+
+
+```
+
+
+Now plot the chlorophyll map for Dec 
+```{r}
+ curr_chl <- 
+    t(as.matrix(readRDS(list.files(
+      path = './Data/',
+      pattern = glob2rx(paste("Chl*", 
+                              dimnames(save_array)[[1]][1], 
+                              "*", sep = "")), full.names = TRUE))))[, 180:1]
+colnames(curr_chl) <- -89.5:89.5
+
+chl.df <- as.data.frame(cbind(long = -179.5:179.5, curr_chl))
+
+chl.df <- chl.df %>%
+  pivot_longer(-long, names_to = "lat", values_to = "Chl") 
+  
+chl.df$lat <- as.numeric(chl.df$lat)
+
+
+lon_lat <- "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+
+sf::st_crs(kk_sf) <- lon_lat
+
+landmass <- rnaturalearth::ne_countries(scale = "large") %>% 
+  sf::st_as_sf(crs = lon_lat)
+
+
+ggplot() +  #gglot version of map 
+  geom_raster(data = chl.df, aes(x = long, y = lat, fill = Chl)) +
+  geom_sf(data = landmass, fill = "grey20", color = NA, size = 0.01) +
+  scale_fill_viridis_c(trans = "log10",
+                       limits = c(0.1,20), oob = scales::squish)
+
+
 ```
 
