@@ -251,6 +251,7 @@ saveRDS(biomass_monthly, "./Output/monthly_biomass_predictions.rds")
 #--------------------------------------------------
 
 ## code to take an average over a few months and produce/save figure
+## takes a vector of month indices eg. c(1,2) would be Jan-Feb average
 monthly_mean_plot <- function(months){
   
   names <- colnames(biomass_monthly[,months])
@@ -369,6 +370,7 @@ ggsave("./Figures/year_surface_biomass.png")
 #-------------------------------------------------
   #Additional: plot the chlorophyll map for Jan
 #-------------------------------------------------
+#predicted biomass is funky-looking so I want to compare to chl data and see how different the trends look. 
  curr_chl <- 
     t(as.matrix(readRDS(list.files(
       path = './Data/',

@@ -82,6 +82,7 @@ watchlist = list(train=xgb_train, test=xgb_test)
 
 # NOTE: this code takes hours to run
 
+## test run
 cvmodel <- xgb.cv(params = list(objective = "reg:gamma",
                      eta = 0.1,
                      max_depth = 4),
