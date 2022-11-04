@@ -240,6 +240,8 @@ for (j in 1:12){
   biomass_monthly[,j] <- save_array2[j, "BRT_Mesozoo", ]
 }
 
+saveRDS(biomass_monthly, "./Output/monthly_biomass_predictions.rds")
+
 ```
 
 
